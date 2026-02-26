@@ -19,29 +19,48 @@ export function setupDub(served: ServeD): vscode.Disposable {
 	subscriptions.push(new BuildSelector(served));
 	subscriptions.push(new CompilerSelector(served));
 
+	//-- Two new selectors --
+	subscriptions.push(new DubCommandSelector(served)); // Added DubCommandSelector
+	subscriptions.push(new RunSelector(served)); // Added RunSelector
+
 	return vscode.Disposable.from(...subscriptions);
 }
 
+//fixed: added support for di format
 export function isStatusbarRelevantDocument(document: vscode.TextDocument): boolean {
 	const language = document.languageId;
-	if (language == "d" || language == "dml" || language == "diet") return true;
+	//Support d, di, dml, diet formats
+	if (language == "d" || language == "di" || language == "dml" || language == "diet") return true;
 	const filename = path.basename(document.fileName.toLowerCase());
 	if (filename == "dub.json" || filename == "dub.sdl") return true;
 	return false;
 }
 
 export function checkStatusbarVisibility(overrideConfig: string, editor?: vscode.TextEditor | null): boolean {
+	// Always show if override is enabled
+	if (config(null).get(overrideConfig, false)) return true;
+
 	if (editor === null) {
-		if (config(null).get(overrideConfig, false)) return true;
-		else return false;
+		// No active editor - show if there is a DUB project
+		const hasDubProject =
+			vscode.workspace.workspaceFolders !== undefined && vscode.workspace.workspaceFolders.length > 0;
+		return hasDubProject;
 	} else {
 		if (!editor) editor = vscode.window.activeTextEditor;
 		if (editor) {
 			if (config(editor.document.uri).get(overrideConfig, false) || isStatusbarRelevantDocument(editor.document))
 				return true;
-			else return false;
+			else {
+				// Even if the file is not relevant, show for DUB projects
+				const hasDubProject =
+					vscode.workspace.workspaceFolders !== undefined && vscode.workspace.workspaceFolders.length > 0;
+				return hasDubProject;
+			}
 		} else {
-			return false;
+			// No editor - show if there is a DUB project
+			const hasDubProject =
+				vscode.workspace.workspaceFolders !== undefined && vscode.workspace.workspaceFolders.length > 0;
+			return hasDubProject;
 		}
 	}
 }
@@ -82,8 +101,14 @@ class GenericSelector implements vscode.Disposable {
 	}
 
 	updateDocumentVisibility(editor?: vscode.TextEditor | null) {
+		const visible = checkStatusbarVisibility("alwaysShowDubStatusButtons", editor);
+		console.log("[code-d statusbar] updateDocumentVisibility:", {
+			editor: editor ? editor.document.fileName : editor === null ? "null" : "undefined",
+			visible,
+			hasWorkspace: vscode.workspace.workspaceFolders !== undefined,
+		});
 		if (this.item) {
-			if (checkStatusbarVisibility("alwaysShowDubStatusButtons", editor)) this.item.show();
+			if (visible) this.item.show();
 			else this.item.hide();
 		}
 	}
@@ -151,6 +176,142 @@ class CompilerSelector extends GenericSelector {
 			"served/getCompiler",
 			"(compiler)",
 		);
+	}
+}
+
+//fixed: added "Switch DUB Command" to statusbar
+class DubCommandSelector implements vscode.Disposable {
+	item?: vscode.StatusBarItem;
+	subscriptions: vscode.Disposable[] = [];
+	currentCommand: string = "build-run";
+
+	constructor(public served: ServeD) {
+		this.create();
+	}
+
+	protected create() {
+		this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0.92141);
+		this.item.command = "code-d.switchDubCommand";
+		this.item.tooltip = "Switch DUB Command";
+		this.updateDocumentVisibility();
+
+		this.subscriptions.push(
+			vscode.window.onDidChangeActiveTextEditor((editor) => {
+				this.updateDocumentVisibility(editor || null);
+			}),
+		);
+
+		// Listening to command changes
+		this.served.on("dub-command-change", (cmd) => {
+			this.currentCommand = cmd || "build-run";
+			this.update();
+		});
+
+		this.served.on("workspace-change", () => {
+			this.update();
+		});
+
+		this.update();
+	}
+
+	updateDocumentVisibility(editor?: vscode.TextEditor | null) {
+		const visible = checkStatusbarVisibility("alwaysShowDubStatusButtons", editor);
+		console.log("[code-d statusbar] updateDocumentVisibility:", {
+			editor: editor ? editor.document.fileName : editor === null ? "null" : "undefined",
+			visible,
+			hasWorkspace: vscode.workspace.workspaceFolders !== undefined,
+		});
+		if (this.item) {
+			if (visible) this.item.show();
+			else this.item.hide();
+		}
+	}
+
+	update() {
+		if (this.item) {
+			const labels: Record<string, string> = {
+				"build-run": "build & run",
+				run: "run",
+				build: "build",
+				test: "test",
+				clean: "clean",
+			};
+			this.item.text = labels[this.currentCommand] || "$(package)";
+		}
+	}
+
+	dispose() {
+		vscode.Disposable.from(...this.subscriptions).dispose();
+	}
+}
+
+//fixed: added "Build&Run DUB Project" to statusbar
+class RunSelector implements vscode.Disposable {
+	item?: vscode.StatusBarItem;
+	subscriptions: vscode.Disposable[] = [];
+	currentDubCommand: string = "build-run";
+
+	constructor(public served: ServeD) {
+		this.create();
+	}
+
+	protected create() {
+		this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0.9214);
+		this.item.command = "code-d.dubBuildRun";
+		this.updateTooltip();
+		this.updateDocumentVisibility();
+
+		this.subscriptions.push(
+			vscode.window.onDidChangeActiveTextEditor((editor) => {
+				this.updateDocumentVisibility(editor || null);
+			}),
+		);
+
+		// Listen to DUB command changes to update tooltip
+		this.served.on("dub-command-change", (cmd) => {
+			this.currentDubCommand = cmd || "build-run";
+			this.updateTooltip();
+		});
+
+		this.served.on("workspace-change", () => {
+			this.update();
+		});
+
+		this.update();
+	}
+
+	updateTooltip() {
+		if (this.item) {
+			const tooltips: Record<string, string> = {
+				"build-run": "Build & Run the DUB Project",
+				run: "Run the DUB Project",
+				build: "Build the DUB Project",
+				test: "Run DUB Tests",
+				clean: "Clean DUB Build Artifacts",
+			};
+			this.item.tooltip = tooltips[this.currentDubCommand] || "Run DUB Project";
+		}
+	}
+
+	updateDocumentVisibility(editor?: vscode.TextEditor | null) {
+		const visible = checkStatusbarVisibility("alwaysShowDubStatusButtons", editor);
+		console.log("[code-d statusbar] updateDocumentVisibility:", {
+			editor: editor ? editor.document.fileName : editor === null ? "null" : "undefined",
+			visible,
+			hasWorkspace: vscode.workspace.workspaceFolders !== undefined,
+		});
+		if (this.item) {
+			if (visible) this.item.show();
+			else this.item.hide();
+		}
+	}
+
+	update() {
+		if (this.item) this.item.text = "$(play)";
+	}
+
+	dispose() {
+		vscode.Disposable.from(...this.subscriptions).dispose();
 	}
 }
 

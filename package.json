@@ -11,7 +11,7 @@
 	"icon": "images/dlogo-square.png",
 	"license": "MIT",
 	"engines": {
-		"vscode": "^1.93.0"
+		"vscode": "^1.105.0"
 	},
 	"categories": [
 		"Programming Languages",
@@ -25,7 +25,14 @@
 		"onDebugDynamicConfigurations",
 		"onDebugInitialConfigurations",
 		"onCommand:code-d.stop",
-		"onCommand:code-d.addImport"
+		"onCommand:code-d.addImport",
+		"onCommand:code-d.dubBuildRun",
+		"onCommand:code-d.checkProcesses",
+		"onLanguage:d",
+		"workspaceContains:dub.json",
+		"workspaceContains:dub.sdl",
+		"workspaceContains:**/dub.json",
+		"workspaceContains:**/dub.sdl"
 	],
 	"main": "./out/extension",
 	"keywords": [
@@ -1127,6 +1134,14 @@
 					"when": "resourceFilename =~ /dub\\.json|dub\\.sdl/"
 				},
 				{
+					"command": "code-d.dubBuildRun",
+					"when": "editorLangId == 'd'"
+				},
+				{
+					"command": "code-d.switchDubCommand",
+					"when": "editorLangId == 'd'"
+				},
+				{
 					"command": "code-d.openDocsAtCursor",
 					"when": "false"
 				}
@@ -1199,6 +1214,16 @@
 			{
 				"command": "code-d.switchBuildType",
 				"title": "Switch Build Type",
+				"category": "code-d"
+			},
+			{
+				"command": "code-d.switchDubCommand",
+				"title": "Switch DUB Command",
+				"category": "code-d"
+			},
+			{
+				"command": "code-d.dubBuildRun",
+				"title": "Build & Run DUB Project",
 				"category": "code-d"
 			},
 			{
@@ -1298,6 +1323,15 @@
 				"command": "code-d.dumpServedInfo",
 				"title": "Dump serve-d state to output",
 				"category": "code-d"
+			},
+			{
+				"command": "code-d.checkProcesses",
+				"title": "Check D Language Processes",
+				"category": "code-d",
+				"icon": {
+					"light": "images/refresh-light.svg",
+					"dark": "images/refresh-dark.svg"
+				}
 			}
 		],
 		"taskDefinitions": [
@@ -1508,7 +1542,7 @@
 		"@types/async": "^3.2.25",
 		"@types/jsdom": "^27.0.0",
 		"@types/mocha": "^10.0.10",
-		"@types/node": "^24.8.1",
+		"@types/node": "^24.10.13",
 		"@types/parse5": "^7.0.0",
 		"@types/vscode": "^1.105.0",
 		"@types/which": "^3.0.4",

@@ -36,6 +36,8 @@ import { GCProfiler } from "./gcprofiler";
 import { CoverageAnalyzer } from "./coverage";
 import { registerCommands, registerClientCommands } from "./commands";
 import { DubDependency, DubDependencyInfo } from "./dub-view";
+import { ProcessManager } from "./process-manager";
+import { checkDubProject } from "./dub-project-check";
 
 import { CodedAPI, Snippet } from "code-d-api";
 import { builtinPlugins } from "./builtin_plugins";
@@ -82,7 +84,11 @@ export type DScannerIniFeature = {
 	name: string;
 	enabled: "disabled" | "enabled" | "skip-unittest";
 };
-export type DScannerIniSection = { description: string; name: string; features: DScannerIniFeature[] };
+export type DScannerIniSection = {
+	description: string;
+	name: string;
+	features: DScannerIniFeature[];
+};
 export interface ActiveDubConfig {
 	packagePath: string;
 	packageName: string;
@@ -297,20 +303,32 @@ async function startClient(context: vscode.ExtensionContext) {
 	};
 	const client = new LanguageClient("serve-d", "code-d & serve-d", executable, clientOptions);
 	await client.start();
+	console.log("[code-d] LSP client started, state:", client.state);
+
+	// Get the PID of the serve-d process (via a private property)
+	const servedPid = (client as unknown as { _serverProcess?: { pid: number } })._serverProcess?.pid;
+	console.log("[code-d] serve-d process started with PID:", servedPid);
+
 	served = new ServeD(client, outputChannel);
 
 	context.subscriptions.push({
 		dispose() {
+			console.log("[code-d] Disposing LSP client, stopping serve-d...");
+			const pid = (client as unknown as { _serverProcess?: { pid: number } })._serverProcess?.pid;
+			console.log("[code-d] serve-d PID:", pid);
 			client.stop();
+			console.log("[code-d] LSP client stopped");
 		},
 	});
 
 	registerClientCommands(context, client, served);
 	linkDebuggersWithServed(served);
 
-	const updateSetting = new NotificationType<{ section: string; value: unknown; global: boolean }>(
-		"coded/updateSetting",
-	);
+	const updateSetting = new NotificationType<{
+		section: string;
+		value: unknown;
+		global: boolean;
+	}>("coded/updateSetting");
 	client.onNotification(updateSetting, (arg: { section: string; value: unknown; global: boolean }) => {
 		hideNextPotentialConfigUpdateWarning();
 		config(null).update(arg.section, arg.value, arg.global);
@@ -322,6 +340,7 @@ async function startClient(context: vscode.ExtensionContext) {
 	});
 
 	client.onNotification("coded/initDubTree", function () {
+		console.log("[code-d] initDubTree received, setting up status bar");
 		context.subscriptions.push(statusbar.setupDub(served));
 		vscode.commands.executeCommand("setContext", "d.hasDubProject", true);
 		context.subscriptions.push(vscode.window.registerTreeDataProvider<DubDependency>("dubDependencies", served));
@@ -544,7 +563,46 @@ async function lateInitInteractive(roots: string[], decisions: boolean[], allowL
 
 export let currentVersion: string | undefined;
 export let extensionContext: vscode.ExtensionContext;
+
+/**
+ * Updating the working folder context based on the presence of a DUB project
+ */
+let lastDubProjectState: boolean | null = null;
+
+async function updateWorkspaceContext(): Promise<void> {
+	const project = await checkDubProject();
+
+	console.log("[code-d] Checking workspace context:", {
+		hasWorkspace: project.hasWorkspace,
+		hasDubJson: project.hasDubJson,
+		hasDubSdl: project.hasDubSdl,
+		isDubProject: project.isDubProject,
+		dubConfigPath: project.dubConfigPath,
+	});
+
+	// Setting the context for the when clause in package.json
+	await vscode.commands.executeCommand("setContext", "d.hasDubProject", project.isDubProject);
+	await vscode.commands.executeCommand("setContext", "d.hasWorkspace", project.hasWorkspace);
+
+	// If there was a DUB project but it disappeared, stop the processes.
+	if (lastDubProjectState === true && !project.isDubProject) {
+		console.log("[code-d] DUB project no longer exists, stopping processes...");
+		await ProcessManager.killAllProcesses(true);
+	}
+
+	lastDubProjectState = project.isDubProject;
+
+	console.log(
+		`[code-d] Workspace context updated: isDubProject=${project.isDubProject}, hasWorkspace=${project.hasWorkspace}`,
+	);
+}
+
 export function activate(context: vscode.ExtensionContext): CodedAPI {
+	console.log("[code-d] Extension activated!");
+	console.log(
+		"[code-d] Workspace folders:",
+		vscode.workspace.workspaceFolders?.map((f) => f.name),
+	);
 	extensionContext = context;
 
 	// TODO: Port to serve-d
@@ -605,6 +663,50 @@ export function activate(context: vscode.ExtensionContext): CodedAPI {
 	registerCommands(context);
 
 	registerDebuggers(context);
+
+	// Checking the DUB project and setting the activation context
+	updateWorkspaceContext();
+
+	//  Watcher for monitoring changes in the working folder
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeWorkspaceFolders(async (event) => {
+			console.log(
+				`[code-d] Workspace folders changed: added=${event.added.length}, removed=${event.removed.length}`,
+			);
+			console.log(
+				"[code-d] Added folders:",
+				event.added.map((f) => f.uri.fsPath),
+			);
+			console.log(
+				"[code-d] Removed folders:",
+				event.removed.map((f) => f.uri.fsPath),
+			);
+			await updateWorkspaceContext();
+
+			// If the working folder is deleted, stop the processes
+			if (event.removed.length > 0) {
+				// Let's check if there are any working folders left.
+				if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+					console.log("[code-d] No workspace folders remaining, stopping all processes...");
+					const result = await ProcessManager.killAllProcesses(true);
+					console.log(
+						`[code-d] Process stop result: serve-d=${result.served}, dcd-server=${result.dcdServer}, dcd-client=${result.dcdClient}`,
+					);
+				} else {
+					console.log(
+						`[code-d] Still have ${vscode.workspace.workspaceFolders.length} workspace folder(s), keeping processes`,
+					);
+				}
+			}
+		}),
+	);
+
+	// Watcher for monitoring changes to dub.json/dub.sdl files
+	const dubConfigWatcher = vscode.workspace.createFileSystemWatcher("**/{dub.json,dub.sdl}", false, false, false);
+	dubConfigWatcher.onDidCreate(async () => await updateWorkspaceContext());
+	dubConfigWatcher.onDidChange(async () => await updateWorkspaceContext());
+	dubConfigWatcher.onDidDelete(async () => await updateWorkspaceContext());
+	context.subscriptions.push(dubConfigWatcher);
 
 	{
 		context.subscriptions.push(vscode.commands.registerCommand("code-d.showGCCalls", GCProfiler.listProfileCache));
@@ -709,7 +811,9 @@ async function preStartup(context: vscode.ExtensionContext) {
 		if (!dubPath) dubPath = <string>expandTilde(config(null).get("dubPath", "dub"));
 
 		try {
-			await spawnOneShotCheck(dubPath, ["--version"], false, { cwd: vscode.workspace.rootPath });
+			await spawnOneShotCheck(dubPath, ["--version"], false, {
+				cwd: vscode.workspace.rootPath,
+			});
 		} catch {
 			// for example invalid executable error
 			if (!tryCompiler) return false;
@@ -1253,4 +1357,38 @@ function expandTilde(filepath: string): string {
 	}
 
 	return filepath;
+}
+
+/**
+ * Extension deactivation function - stops the processes serve-d, dcd-server, dcd-client
+ */
+export function deactivate(): Thenable<void> {
+	console.log("Deactivating code-d extension...");
+
+	// Stop all code-d processes synchronously
+	return new Promise((resolve) => {
+		// First, stop the Language Client
+		if (served && served.client) {
+			served.client.stop().then(
+				() => {
+					console.log("Language client stopped");
+				},
+				(err) => {
+					console.log("Error stopping language client:", err);
+				},
+			);
+		}
+
+		// Then we kill the processes
+		ProcessManager.killAllProcesses(true).then((result) => {
+			console.log(
+				`Processes killed: serve-d=${result.served}, dcd-server=${result.dcdServer}, dcd-client=${result.dcdClient}`,
+			);
+
+			// We give time for the processes to complete
+			setTimeout(() => {
+				resolve();
+			}, 1000);
+		});
+	});
 }

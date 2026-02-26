@@ -11,6 +11,7 @@ import { showDpldocsSearch } from "./dpldocs";
 import { showQuickPickWithInput, simpleBytesToString } from "./util";
 import { listCompilers, makeCompilerDescription } from "./compilers";
 import { DTerminalLinkProvider } from "./terminal-link-provider";
+import { ProcessManager } from "./process-manager";
 
 const multiTokenWordPattern = /[^`~!@#%^&*()=+[{\]}\\|;:'",.<>/?\s]+(?:\.[^`~!@#%^&*()=+[{\]}\\|;:'",.<>/?\s]+)*/;
 
@@ -19,6 +20,51 @@ export function registerClientCommands(context: vscode.ExtensionContext, client:
 
 	served.tasksProvider = new DubTasksProvider(client);
 	subscriptions.push(vscode.tasks.registerTaskProvider("dub", served.tasksProvider));
+
+	// Command to check the state of processes
+	subscriptions.push(
+		vscode.commands.registerCommand("code-d.checkProcesses", async () => {
+			const { served: servedProc, dcdServer, dcdClient } = await ProcessManager.checkAllProcesses();
+
+			const status = [
+				ProcessManager.formatProcessStatus(servedProc),
+				ProcessManager.formatProcessStatus(dcdServer),
+				ProcessManager.formatProcessStatus(dcdClient),
+			].join("\n");
+
+			// Silent check - output to output channel
+			served.outputChannel.appendLine("=== Process Status ===");
+			served.outputChannel.appendLine(status);
+
+			// Displaying status in the status bar
+			vscode.window.setStatusBarMessage(
+				`code-d: ${servedProc.running ? "$(check)" : "$(x)"} serve-d | ${dcdServer.running ? "$(check)" : "$(x)"} dcd-server | ${dcdClient.running ? "$(check)" : "$(x)"} dcd-client`,
+				5000,
+			);
+
+			// Automatically stop frozen processes
+			const toKill: string[] = [];
+			if (servedProc.running) toKill.push("serve-d");
+			if (dcdServer.running) toKill.push("dcd-server");
+			if (dcdClient.running) toKill.push("dcd-client");
+
+			if (toKill.length > 0) {
+				served.outputChannel.appendLine(`Stopping processes: ${toKill.join(", ")}`);
+				const killed = await ProcessManager.killAllProcesses(true);
+
+				const killedStatus = [
+					`serve-d: ${killed.served ? "stopped" : "was not running"}`,
+					`dcd-server: ${killed.dcdServer ? "stopped" : "was not running"}`,
+					`dcd-client: ${killed.dcdClient ? "stopped" : "was not running"}`,
+				].join("\n");
+
+				served.outputChannel.appendLine("=== Stop Result ===");
+				served.outputChannel.appendLine(killedStatus);
+			} else {
+				served.outputChannel.appendLine("No processes to stop");
+			}
+		}),
+	);
 
 	subscriptions.push(
 		vscode.commands.registerCommand(
@@ -93,8 +139,8 @@ export function registerClientCommands(context: vscode.ExtensionContext, client:
 						});
 				});
 			},
-			(err: unknown) => {
-				client.outputChannel.appendLine(err + "");
+			(_err: unknown) => {
+				client.outputChannel.appendLine(String(_err));
 				vscode.window.showErrorMessage("Failed to switch build type. See extension output for details.");
 			},
 		),
@@ -105,8 +151,17 @@ export function registerClientCommands(context: vscode.ExtensionContext, client:
 			client.sendRequest<string>("served/getCompiler").then(
 				() => {
 					const settingCompiler = config(null).get("dubCompiler", undefined);
-					const extra: (vscode.QuickPickItem & { value: string; custom?: true })[] = settingCompiler
-						? [{ label: settingCompiler, value: settingCompiler, description: "(from User Settings)" }]
+					const extra: (vscode.QuickPickItem & {
+						value: string;
+						custom?: true;
+					})[] = settingCompiler
+						? [
+								{
+									label: settingCompiler,
+									value: settingCompiler,
+									description: "(from User Settings)",
+								},
+							]
 						: [];
 					showQuickPickWithInput(
 						listCompilers().then((compilers) =>
@@ -141,6 +196,245 @@ export function registerClientCommands(context: vscode.ExtensionContext, client:
 					vscode.window.showErrorMessage("Failed to switch compiler. See extension output for details.");
 				},
 			);
+		}),
+	);
+
+	//fixed: added "Switch DUB Command" command
+	subscriptions.push(
+		vscode.commands.registerCommand("code-d.switchDubCommand", () => {
+			const commands: (vscode.QuickPickItem & { value: string })[] = [
+				{
+					label: "Build & Run",
+					value: "build-run",
+					description: "Build and run the DUB project",
+				},
+				{
+					label: "Run",
+					value: "run",
+					description: "Run the DUB project",
+				},
+				{
+					label: "Build",
+					value: "build",
+					description: "Build the DUB project",
+				},
+				{ label: "Test", value: "test", description: "Run DUB tests" },
+				{
+					label: "Clean",
+					value: "clean",
+					description: "Clean DUB build artifacts",
+				},
+			];
+
+			vscode.window
+				.showQuickPick(commands, {
+					placeHolder: "Select DUB command",
+					title: "Switch DUB Command",
+				})
+				.then((selected) => {
+					if (selected) {
+						// Emit an event to update the statusbar
+						served.emit("dub-command-change", selected.value);
+						vscode.window.showInformationMessage(`DUB command switched to: ${selected.label}`);
+					}
+				});
+		}),
+	);
+
+	//fixed: added "Build & Run DUB Project" command
+	subscriptions.push(
+		vscode.commands.registerCommand("code-d.dubBuildRun", async () => {
+			try {
+				// Get the DUB project configuration
+				const project = await served.getActiveDubConfig();
+				const workingDir = path.join(project.packagePath, project.workingDirectory);
+
+				// Get the current architecture
+				const archType = await client.sendRequest<string>("served/getArchType");
+
+				// Get the current build type
+				const buildType = await client.sendRequest<string>("served/getBuildType");
+
+				// Get the current compiler
+				const compiler = await client.sendRequest<string>("served/getCompiler");
+
+				// Debugging: Logging the project to check paths
+				//console.log(`[dubBuildRun] project.targetPath: ${project.targetPath}`);
+				//console.log(`[dubBuildRun] project.targetName: ${project.targetName}`);
+				//console.log(
+				//  `[dubBuildRun] project.packagePath: ${project.packagePath}`,
+				//);
+				//console.log(
+				//  `[dubBuildRun] project.workingDirectory: ${project.workingDirectory}`,
+				//);
+				//client.outputChannel.appendLine(
+				// `[dubBuildRun] project.targetPath: ${project.targetPath}`,
+				//);
+				//client.outputChannel.appendLine(
+				//  `[dubBuildRun] project.targetName: ${project.targetName}`,
+				//);
+
+				// Determine the command and arguments based on currentDubCommand
+				let taskName: string;
+				let dubArgs: string[];
+
+				switch (currentDubCommand) {
+					case "build-run": {
+						taskName = "DUB Build & Run";
+						// For build-run, we always compile and run
+						dubArgs = ["run"];
+						if (buildType) dubArgs.push(`--build=${buildType}`);
+						if (compiler) dubArgs.push(`--compiler=${compiler}`);
+						if (archType) dubArgs.push(`--arch=${archType}`);
+						break;
+					}
+
+					case "build": {
+						taskName = "DUB Build";
+						// For build we add arguments
+						dubArgs = ["build", "--force"];
+						if (buildType) dubArgs.push(`--build=${buildType}`);
+						if (compiler) dubArgs.push(`--compiler=${compiler}`);
+						if (archType) dubArgs.push(`--arch=${archType}`);
+						break;
+					}
+
+					case "run": {
+						taskName = "DUB Run";
+						// Just run dub without arguments (dub will decide whether to recompile or not)
+						dubArgs = ["run"];
+						break;
+					}
+
+					case "test": {
+						taskName = "DUB Test";
+						// For test, we check for the presence of the test executable file
+						// We use resolve to get the absolute path
+						const testTargetPath = path.resolve(project.targetPath, `${project.targetName}-unittest`);
+
+						// Debug: log the path
+						//console.log(
+						//  `[dubBuildRun] Checking test executable at: ${testTargetPath}`,
+						//);
+						//client.outputChannel.appendLine(
+						//  `[dubBuildRun] Checking test executable at: ${testTargetPath}`,
+						//);
+
+						if (!fs.existsSync(testTargetPath)) {
+							vscode.window.showWarningMessage(
+								`Test file not found: ${testTargetPath}\nBuild the tests first (select the "Build" command).`,
+							);
+							client.outputChannel.appendLine(
+								`[dubBuildRun] Test executable not found: ${testTargetPath}`,
+							);
+							return;
+						}
+						dubArgs = ["test"];
+						break;
+					}
+
+					case "clean": {
+						taskName = "DUB Clean";
+						dubArgs = ["clean"];
+						break;
+					}
+
+					default: {
+						taskName = "DUB Build & Run";
+						dubArgs = ["run"];
+						if (buildType) dubArgs.push(`--build=${buildType}`);
+						if (compiler) dubArgs.push(`--compiler=${compiler}`);
+						if (archType) dubArgs.push(`--arch=${archType}`);
+						break;
+					}
+				}
+
+				// Debugging
+				//console.log(
+				//  `[dubBuildRun] WorkingDir: ${workingDir}, Build type: ${buildType || "(none)"}, Compiler: ${compiler || "(none)"}, Arch: ${archType || "(none)"}, Command: ${currentDubCommand}`,
+				//);
+				//client.outputChannel.appendLine(
+				//  `[dubBuildRun] WorkingDir: ${workingDir}, Build type: ${buildType || "(none)"}, Compiler: ${compiler || "(none)"}, Arch: ${archType || "(none)"}, Command: ${currentDubCommand}`,
+				//);
+				//vscode.window.showInformationMessage(
+				//  `dubBuildRun: ${taskName}${buildType ? ` (Build: ${buildType})` : ""}${compiler ? `, Compiler: ${compiler}` : ""}${archType ? `, Arch: ${archType}` : ""}`,
+				//);
+
+				//console.log(`[dubBuildRun] Command: dub ${dubArgs.join(" ")}`);
+				//client.outputChannel.appendLine(
+				//  `[dubBuildRun] Command: dub ${dubArgs.join(" ")}`,
+				//);
+				//client.outputChannel.appendLine(
+				//  `[dubBuildRun] WorkingDir: ${workingDir}`,
+				//);
+
+				const task = new vscode.Task(
+					{
+						type: "dub",
+						command: currentDubCommand,
+						buildType: buildType,
+						_id: "dub-build-run-" + Date.now().toString(36),
+					},
+					vscode.TaskScope.Workspace,
+					taskName,
+					"dub",
+					new vscode.ShellExecution(`dub ${dubArgs.join(" ")}`, {
+						cwd: workingDir,
+					}),
+				);
+				task.presentationOptions = {
+					reveal: vscode.TaskRevealKind.Always,
+					focus: false,
+					echo: false,
+					showReuseMessage: false,
+					clear: false,
+					panel: vscode.TaskPanelKind.New,
+				};
+
+				// Debigging: log before executing the task
+				//console.log(`[dubBuildRun] Executing task...`);
+				//client.outputChannel.appendLine(`[dubBuildRun] Executing task...`);
+
+				vscode.tasks.executeTask(task);
+
+				// Debug: log after execution
+				//console.log(`[dubBuildRun] Task executed successfully`);
+				//client.outputChannel.appendLine(
+				//  `[dubBuildRun] Task executed successfully`,
+				//);
+			} catch (err) {
+				// Debug: print the error
+				const errorMsg = err instanceof Error ? err.message : String(err);
+				console.log(`[dubBuildRun] Error: ${errorMsg}`);
+				client.outputChannel.appendLine(`[dubBuildRun] Error: ${errorMsg}`);
+				client.outputChannel.appendLine(
+					`[dubBuildRun] Stack: ${err instanceof Error ? err.stack : "no stack"}`,
+				);
+
+				// Fallback: use the current working directory
+				const fallbackDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (fallbackDir) {
+					client.outputChannel.appendLine(`[dubBuildRun] Fallback to workspace: ${fallbackDir}`);
+					const task = new vscode.Task(
+						{ type: "dub", command: currentDubCommand },
+						vscode.TaskScope.Workspace,
+						"DUB Run",
+						"dub",
+						new vscode.ShellExecution("dub", [currentDubCommand], {
+							cwd: fallbackDir,
+						}),
+						["$dmd"],
+					);
+					task.presentationOptions = {
+						reveal: vscode.TaskRevealKind.Always,
+						focus: true,
+						echo: true,
+					};
+					vscode.tasks.executeTask(task);
+				} else {
+					vscode.window.showErrorMessage("No workspace folder found for DUB project");
+				}
+			}
 		}),
 	);
 
@@ -805,7 +1099,9 @@ export function registerCommands(context: vscode.ExtensionContext) {
 						readmes.sort();
 						readmes.reverse(); // README > LICENSE > CHANGELOG
 
-						const items: (vscode.QuickPickItem & { args: [string, boolean] })[] = [];
+						const items: (vscode.QuickPickItem & {
+							args: [string, boolean];
+						})[] = [];
 
 						for (let i = 0; i < readmes.length; i++) {
 							const previewable = isDubReadmePreviewable(readmes[i]);
@@ -965,7 +1261,9 @@ async function previewDubReadme(dir: vscode.Uri, uri: vscode.Uri, useRichPreview
 	const extension = path.extname(uri.path).toLowerCase();
 	if (extension == ".md" || extension == ".markdown") {
 		// most packages have markdown or plaintext README
-		vscode.commands.executeCommand("markdown.showPreview", uri, { locked: true });
+		vscode.commands.executeCommand("markdown.showPreview", uri, {
+			locked: true,
+		});
 	} else if (extension == ".html" || extension == ".htm") {
 		// some packages (e.g. tinyendian) have HTML READMEs
 		const panel = vscode.window.createWebviewPanel(
